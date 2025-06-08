@@ -1,0 +1,92 @@
+import os
+import numpy as np
+import pandas as pd
+import librosa
+from tqdm import tqdm
+
+# Constants
+N_MFCC = 13
+N_BINS = 100
+SR = 32000
+SEGMENT_DURATION = 5  # seconds
+CSV_PATH = 'train.csv'
+OUTPUT_PATH = 'all_bird_features_all_ratings.csv'
+AUDIO_DIR = 'train_audio'
+
+# --- Feature Extraction ---
+def extract_all_features(y, sr=SR, n_mfcc=N_MFCC, n_bins=N_BINS):
+    if len(y) < 1024:
+        y = np.pad(y, (0, 1024 - len(y)), mode='constant')
+
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    delta = librosa.feature.delta(mfcc)
+    delta2 = librosa.feature.delta(mfcc, order=2)
+
+    features = {}
+    for i in range(n_mfcc):
+        features[f'mfcc_{i+1}_mean'] = np.mean(mfcc[i])
+        features[f'mfcc_{i+1}_std'] = np.std(mfcc[i])
+        features[f'delta_mfcc_{i+1}_mean'] = np.mean(delta[i])
+        features[f'delta_mfcc_{i+1}_std'] = np.std(delta[i])
+        features[f'delta2_mfcc_{i+1}_mean'] = np.mean(delta2[i])
+        features[f'delta2_mfcc_{i+1}_std'] = np.std(delta2[i])
+
+    features['zcr'] = np.mean(librosa.feature.zero_crossing_rate(y=y))
+    features['rms'] = np.mean(librosa.feature.rms(y=y))
+    features['spectral_centroid'] = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
+    features['spectral_bandwidth'] = np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))
+    features['spectral_rolloff'] = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
+    features['spectral_flatness'] = np.mean(librosa.feature.spectral_flatness(y=y))
+
+    hist, _ = np.histogram(y, bins=n_bins, density=True)
+    hist = hist[hist > 0]
+    entropy = -np.sum(hist * np.log2(hist))
+    features['signal_entropy'] = entropy
+
+    return features
+
+# --- Audio Segmentation ---
+def segment_audio(y, sr=SR, segment_duration=SEGMENT_DURATION):
+    segment_length = int(sr * segment_duration)
+    total_length = segment_length * ((len(y) + segment_length - 1) // segment_length)
+    y = np.pad(y, (0, total_length - len(y)))
+    return [y[i:i + segment_length] for i in range(0, total_length, segment_length)]
+
+# --- Main Processing ---
+metadata = pd.read_csv(CSV_PATH)
+metadata['filename'] = metadata['filename'].apply(lambda f: os.path.basename(f))
+meta_lookup = metadata.set_index('filename')
+
+all_features = []
+
+for root, _, files in os.walk(AUDIO_DIR):
+    for file in tqdm(files, desc="Processing audio files"):
+        if file.endswith('.ogg') and file in meta_lookup.index:
+            try:
+                file_path = os.path.join(root, file)
+                y, _ = librosa.load(file_path, sr=SR)
+                segments = segment_audio(y)
+
+                for i, segment in enumerate(segments):
+                    feats = extract_all_features(segment)
+                    # Remove the .ogg extension and append the chunk index
+                    base_name = os.path.splitext(file)[0]  # removes .ogg
+                    feats['filename'] = f"{base_name}_{5*i+5}"
+                    feats['primary_label'] = meta_lookup.loc[file, 'primary_label']
+                    feats['rating'] = meta_lookup.loc[file, 'rating']
+                    feats['latitude'] = meta_lookup.loc[file, 'latitude']
+                    feats['longitude'] = meta_lookup.loc[file, 'longitude']
+                    feats['collection'] = meta_lookup.loc[file, 'collection']
+                    all_features.append(feats)
+
+
+            except Exception as e:
+                print(f"Error processing {file}: {e}")
+
+# --- Save to CSV ---
+df_out = pd.DataFrame(all_features)
+df_out.to_csv(OUTPUT_PATH, index=False)
+print(f"\n✅ Saved {len(df_out)} feature rows from 5-second chunks to {OUTPUT_PATH}")
+
+
+    
