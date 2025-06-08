@@ -1,0 +1,114 @@
+import pandas as pd
+import numpy as np
+from catboost import CatBoostClassifier
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.metrics import roc_auc_score
+import joblib
+
+# --- Paths ---
+NORMALIZED_CSV = 'normalized_bird_features_all_ratings_CLEANED.csv'
+MODEL_PATH = 'catboost_bird_model_classifier_better_updated.cbm'
+PROBABILITIES_OUTPUT_CSV = 'bird_probabilities_all_ratings_fixed_109.csv'
+LABEL_MAPPING_PATH = 'label_mapping3.pkl'
+
+# --- Load dataset ---
+df = pd.read_csv(NORMALIZED_CSV, low_memory=False)
+
+# --- Setup column names ---
+label_col = 'primary_label'
+id_col = 'filename'
+rating_col = 'rating'
+
+# --- Normalize labels and fix class mapping ---
+df[label_col] = df[label_col].astype(str).str.strip()
+label_categories = sorted(df[label_col].unique())  # Lock to 206 classes
+df[label_col] = pd.Categorical(df[label_col], categories=label_categories)
+label_mapping = dict(enumerate(df[label_col].cat.categories))  # ✅ Save BEFORE .cat.codes
+inv_label_mapping = {v: k for k, v in label_mapping.items()}
+df[label_col] = df[label_col].cat.codes  # Convert to integer labels
+
+# --- Grouping based on base filename (e.g., "XC12345_5" -> "XC12345") ---
+df['group'] = df[id_col].str.extract(r'^(.*)_\d+$')
+df = df.dropna(subset=['group'])
+
+# --- Prepare train/val split ---
+X = df.drop(columns=[label_col, id_col, rating_col, 'group'])
+y = df[label_col]
+groups = df['group']
+fnames = df[id_col]
+
+splitter = GroupShuffleSplit(n_splits=1, test_size=0.2)
+train_idx, val_idx = next(splitter.split(X, y, groups=groups))
+
+X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+fnames_val = fnames.iloc[val_idx]
+
+# --- Drop val samples with unseen classes ---
+valid_classes = set(y_train.unique())
+val_mask = y_val.isin(valid_classes)
+
+dropped_classes = set(y_val.unique()) - valid_classes
+if dropped_classes:
+    print(f"⚠️ Dropping {len(dropped_classes)} unseen classes from validation set: {dropped_classes}")
+
+X_val = X_val[val_mask]
+y_val = y_val[val_mask]
+fnames_val = fnames_val[val_mask]
+
+# --- Train CatBoost model ---
+model = CatBoostClassifier(
+    iterations=1500,
+    learning_rate=0.015,
+    depth=6,
+    loss_function='MultiClass',
+    eval_metric='AUC:type=Mu',
+    early_stopping_rounds=50,
+    verbose=50
+)
+
+model.fit(X_train, y_train, eval_set=(X_val, y_val))
+
+# --- Predict and evaluate ---
+y_val_proba = model.predict_proba(X_val)
+
+# Get valid class indices based on model output shape
+valid_indices = list(range(y_val_proba.shape[1]))
+
+lb = LabelBinarizer()
+lb.fit(valid_indices)
+y_val_bin = lb.transform(y_val)
+
+# Handle binary case
+if y_val_bin.shape[1] == 1:
+    y_val_bin = pd.get_dummies(y_val)
+
+# Filter both y_true and y_pred to only columns present in the model output
+valid_cols = np.where(y_val_bin.sum(axis=0) > 0)[0]
+valid_cols = [i for i in valid_cols if i < y_val_proba.shape[1]]
+y_val_bin_filtered = y_val_bin[:, valid_cols]
+y_val_proba_filtered = y_val_proba[:, valid_cols]
+
+roc_auc = roc_auc_score(y_val_bin_filtered, y_val_proba_filtered, average='macro')
+print(f"\n✅ Validation ROC-AUC (macro, filtered): {roc_auc:.4f}")
+
+# --- Save per-class probabilities ---
+real_labels = [label_mapping[i] for i in valid_indices]
+proba_df = pd.DataFrame(y_val_proba, columns=real_labels[:y_val_proba.shape[1]])
+proba_df[id_col] = fnames_val.values
+proba_df[label_col] = y_val.map(label_mapping).values
+proba_df.to_csv(PROBABILITIES_OUTPUT_CSV, index=False)
+print(f"✅ Saved predicted probabilities to {PROBABILITIES_OUTPUT_CSV}")
+
+# --- Save model and label mapping ---
+print("🔍 Full label_mapping size (should be 206):", len(label_mapping))
+print("✅ Unique classes in y_train:", len(np.unique(y_train)))
+print("✅ Unique classes in y_val:", len(np.unique(y_val)))
+print("🧪 predict_proba shape:", y_val_proba.shape)
+
+model.save_model(MODEL_PATH)
+print(f"✅ Model saved to {MODEL_PATH}")
+
+joblib.dump(label_mapping, LABEL_MAPPING_PATH)
+print(f"✅ Label mapping saved to {LABEL_MAPPING_PATH}")
