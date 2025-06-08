@@ -1,0 +1,130 @@
+import os
+import numpy as np
+import pandas as pd
+import librosa
+import joblib
+from catboost import CatBoostClassifier
+
+
+# Constants
+TEST_AUDIO_DIR = '/kaggle/input/birdclef-2025/test_soundscapes'
+MEANS_STDS_PATH = '/kaggle/input/all-features-means/means_of_all_features_birds.csv'
+MODEL_PATH = '/kaggle/input/catboost-improved-on-bird-features/pytorch/default/1/catboost_bird_model_classifier_better_updated.cbm'
+SAMPLE_SUB_PATH = '/kaggle/input/birdclef-2025/sample_submission.csv'
+OUTPUT_PATH = 'submission.csv'
+LABEL_MAPPING_PATH = '/kaggle/input/joblib-stuff/label_mapping.pkl'
+# --- Constants ---
+N_MFCC = 13
+N_BINS = 100
+SR = 32000
+SEGMENT_DURATION = 5  # seconds
+
+# --- Load normalization statistics ---
+means_stds_df = pd.read_csv(MEANS_STDS_PATH, index_col=0)
+feature_means = means_stds_df['mean']
+feature_stds = means_stds_df['std']
+
+# ✅ Load label mapping (index → class string)
+label_mapping = joblib.load(LABEL_MAPPING_PATH)  # e.g., {0: '11160', 1: '12971', ...}
+inv_label_mapping = {v: k for k, v in label_mapping.items()}  # Optional
+# --- Feature extraction ---
+def normalize_features(features):
+    normalized = {}
+    for key, value in features.items():
+        if key in feature_means and key in feature_stds:
+            mean = feature_means[key]
+            std = feature_stds[key]
+            normalized[key] = (value - mean) / std if std != 0 else 0.0
+        else:
+            normalized[key] = value
+    return normalized
+
+def extract_all_features_from_array(y, sr=SR, n_mfcc=N_MFCC, n_bins=N_BINS):
+    if len(y) < 1024:
+        y = np.pad(y, (0, 1024 - len(y)), mode='constant')
+
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    delta = librosa.feature.delta(mfcc)
+    delta2 = librosa.feature.delta(mfcc, order=2)
+
+    features = {}
+    for i in range(n_mfcc):
+        features[f'mfcc_{i+1}_mean'] = np.mean(mfcc[i])
+        features[f'mfcc_{i+1}_std'] = np.std(mfcc[i])
+        features[f'delta_mfcc_{i+1}_mean'] = np.mean(delta[i])
+        features[f'delta_mfcc_{i+1}_std'] = np.std(delta[i])
+        features[f'delta2_mfcc_{i+1}_mean'] = np.mean(delta2[i])
+        features[f'delta2_mfcc_{i+1}_std'] = np.std(delta2[i])
+
+    features['zcr'] = np.mean(librosa.feature.zero_crossing_rate(y=y))
+    features['rms'] = np.mean(librosa.feature.rms(y=y))
+    features['spectral_centroid'] = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
+    features['spectral_bandwidth'] = np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))
+    features['spectral_rolloff'] = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
+    features['spectral_flatness'] = np.mean(librosa.feature.spectral_flatness(y=y))
+
+    hist, _ = np.histogram(y, bins=n_bins, density=True)
+    hist = hist[hist > 0]
+    entropy = -np.sum(hist * np.log2(hist))
+    features['signal_entropy'] = entropy
+
+    return normalize_features(features)
+
+def segment_audio(y, sr=SR, segment_duration=5):
+    segment_length = int(sr * segment_duration)
+    total_length = segment_length * ((len(y) + segment_length - 1) // segment_length)
+    y = np.pad(y, (0, total_length - len(y)))
+    return [y[i:i + segment_length] for i in range(0, total_length, segment_length)]
+
+# --- Main prediction loop ---
+def process_and_predict_segments(audio_dir):
+    model = CatBoostClassifier()
+    model.load_model(MODEL_PATH)
+
+    sample_submission = pd.read_csv(SAMPLE_SUB_PATH)
+    submission_classes = [col for col in sample_submission.columns if col not in ('filename', 'row_id')]
+
+    all_predictions = []
+
+    for filename in os.listdir(audio_dir):
+        if filename.endswith('.ogg'):
+            soundscape_id = filename.replace('.ogg', '')
+            file_path = os.path.join(audio_dir, filename)
+            y, _ = librosa.load(file_path, sr=SR, mono=True)
+            segments = segment_audio(y)
+
+            for i, segment in enumerate(segments):
+                features = extract_all_features_from_array(segment)
+                feature_vector = pd.DataFrame([features])
+                probs = model.predict_proba(feature_vector)[0]
+                result = {}
+
+                # Map predicted class index back to real class name
+                for cls_idx, prob in zip(model.classes_, probs):
+                    true_label = label_mapping.get(cls_idx)
+                    if true_label in submission_classes:
+                        result[true_label] = prob
+
+                # Add row_id
+                row_id = f"{soundscape_id}_{(i + 1) * 5}"
+                result['row_id'] = row_id
+                all_predictions.append(result)
+
+    return pd.DataFrame(all_predictions)
+
+# --- Run everything ---
+final_df = process_and_predict_segments(TEST_AUDIO_DIR)
+
+# Load sample submission and align
+sample_submission = pd.read_csv(SAMPLE_SUB_PATH)
+final_df = final_df.reindex(columns=sample_submission.columns, fill_value=2e-6)
+final_df.fillna(2e-6, inplace=True)
+final_df = final_df[sample_submission.columns]
+
+# Save submission
+final_df.to_csv(OUTPUT_PATH, index=False)
+print("✅ Submission saved to", OUTPUT_PATH)
+
+
+
+
