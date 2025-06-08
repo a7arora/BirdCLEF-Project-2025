@@ -1,0 +1,28 @@
+import pandas as pd
+
+# --- Paths ---
+FEATURE_CSV = 'all_bird_features_all_ratings.csv'
+STATS_CSV = 'means_of_all_features_birds.csv'
+OUTPUT_NORMALIZED_CSV = 'normalized_bird_features_all_ratings.csv'
+
+# --- Load datasets ---
+features_df = pd.read_csv(FEATURE_CSV)
+stats_df = pd.read_csv(STATS_CSV, index_col=0)
+
+# --- Extract means and stds from the stats file ---
+means = stats_df['mean']
+stds = stats_df['std']
+
+# --- Normalize each feature ---
+normalized_df = features_df.copy()
+
+# Only normalize columns that exist in both the dataset and the stats
+feature_cols_to_normalize = [col for col in means.index if col in normalized_df.columns]
+
+for col in feature_cols_to_normalize:
+    normalized_df[col] = (normalized_df[col] - means[col]) / stds[col]
+
+# --- Save the normalized dataset ---
+normalized_df.to_csv(OUTPUT_NORMALIZED_CSV, index=False)
+
+print(f"\n✅ Normalized {len(feature_cols_to_normalize)} features and saved to {OUTPUT_NORMALIZED_CSV}")
